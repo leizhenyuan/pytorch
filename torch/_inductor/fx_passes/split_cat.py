@@ -115,10 +115,10 @@ def normalize_split_base(
     graph = match.graph
     split_input, split_size, split_dim = _get_split_args(split_node)
     if split_input is None or split_dim is None or split_size is None:
-        log.info("couldn't find split args")
+        log.debug("couldn't find split args")
         return
     if "example_value" not in split_node.meta:
-        log.warning("example value absent for node: %s", split_node)
+        log.debug("example value absent for node: %s", split_node)
         return
     assert isinstance(split_node.meta["example_value"], (list, tuple))
     split_sections = [t.size()[split_dim] for t in split_node.meta["example_value"]]
@@ -132,11 +132,17 @@ def normalize_split_base(
         return
     if split_dim < 0:  # Normalize split dim
         split_dim += split_input.meta["example_value"].dim()
+
+    new_args = (split_input, split_sections)
+    new_kwargs = {"dim": split_dim}
+    if split_node.args == new_args and split_node.kwargs == new_kwargs:
+        return
+
     with graph.inserting_after(split_node):
         new_split_node = graph.call_function(
             torch.split,
-            args=(split_input, split_sections),
-            kwargs={"dim": split_dim},
+            args=new_args,
+            kwargs=new_kwargs,
         )
     split_node.replace_all_uses_with(new_split_node)
     new_split_node.meta.update(split_node.meta)
@@ -159,6 +165,48 @@ def normalize_split_default(match: Match, *args, **kwargs):
 
 
 @register_graph_pattern(
+    CallFunctionVarArgs(torch.unbind, users=MULTIPLE),
+    pass_dict=normalization_pass,
+    extra_check=config_flag("split_cat_fx_passes"),
+)
+@register_graph_pattern(
+    CallMethodVarArgs("unbind", users=MULTIPLE),
+    pass_dict=normalization_pass,
+    extra_check=config_flag("split_cat_fx_passes"),
+)
+def normalize_unbind_default(match: Match, *args, **kwargs):
+    node = match.nodes[0]
+    graph = match.graph
+    input = get_arg_value(node, 0, "input")
+    dim = get_arg_value(node, 1, "dim")
+    if dim is None:
+        axis = node.kwargs.get("axis")
+        if axis is not None:
+            dim = axis
+        else:
+            dim = 0
+    if input is None:
+        log.debug("couldn't find unbind args")
+        return
+    if "example_value" not in input.meta:
+        log.debug("example value absent for node: %s", input)
+        return
+    ndim = input.meta["example_value"].ndim
+    if dim < 0:  # Normalize unbind dim
+        dim += ndim
+    with graph.inserting_after(node):
+        new_node = graph.call_function(
+            torch.unbind,
+            args=(input,),
+            kwargs={"dim": dim},
+        )
+    node.replace_all_uses_with(new_node)
+    new_node.meta.update(node.meta)
+    graph.erase_node(node)
+    counters["inductor"]["split_cat_norm"] += 1
+
+
+@register_graph_pattern(
     CallFunctionVarArgs(torch.cat, users=MULTIPLE),
     pass_dict=normalization_pass,
     extra_check=config_flag("split_cat_fx_passes"),
@@ -177,12 +225,12 @@ def normalize_cat_default(match: Match, *args, **kwargs):
         else:
             cat_dim = 0
     if tensors is None or cat_dim is None:
-        log.info("couldn't find cat args")
+        log.debug("couldn't find cat args")
         return
     assert isinstance(tensors, (list, tuple))
     for tensor in itertools.chain([cat_node], tensors):
         if "example_value" not in tensor.meta:
-            log.warning("example value absent for node: %s", tensor)
+            log.debug("example value absent for node: %s", tensor)
             return
 
     ndim = cat_node.meta["example_value"].dim()
@@ -199,11 +247,16 @@ def normalize_cat_default(match: Match, *args, **kwargs):
     if cat_dim < 0:  # Normalize cat dim
         cat_dim += ndim
 
+    new_args = (tensors,)
+    new_kwargs = {"dim": cat_dim}
+    if cat_node.args == new_args and cat_node.kwargs == new_kwargs:
+        return
+
     with graph.inserting_after(cat_node):
         new_cat_node = graph.call_function(
             torch.cat,
-            args=(tensors,),
-            kwargs={"dim": cat_dim},
+            args=new_args,
+            kwargs=new_kwargs,
         )
     cat_node.replace_all_uses_with(new_cat_node)
     new_cat_node.meta.update(cat_node.meta)
@@ -222,14 +275,14 @@ def normalize_stack_default(match: Match, *args, **kwargs):
     tensors = get_arg_value(node, 0, "tensors")
     dim = get_arg_value(node, 1, "dim") or 0
     if tensors is None or dim is None:
-        log.info("couldn't find stack args")
+        log.debug("couldn't find stack args")
         return
     assert isinstance(tensors, (list, tuple))
 
     # A bug in pytorch, some nodes miss the example_value metadata
     for tensor in itertools.chain([node], tensors):
         if "example_value" not in tensor.meta:
-            log.warning("example value absent for node: %s", tensor)
+            log.debug("example value absent for node: %s", tensor)
             return
 
     ndim = node.meta["example_value"].dim()
