@@ -6,6 +6,10 @@ namespace c10d {
 PrefixStore::PrefixStore(std::string prefix, c10::intrusive_ptr<Store> store)
     : prefix_(std::move(prefix)), store_(std::move(store)) {}
 
+c10::intrusive_ptr<Store> PrefixStore::clone() {
+  return c10::make_intrusive<PrefixStore>(prefix_, store_->clone());
+}
+
 std::string PrefixStore::joinKey(const std::string& key) {
   return prefix_ + "/" + key;
 }
@@ -83,6 +87,7 @@ void PrefixStore::append(
 std::vector<std::vector<uint8_t>> PrefixStore::multiGet(
     const std::vector<std::string>& keys) {
   std::vector<std::string> prefixed_keys;
+  prefixed_keys.reserve(keys.size());
   for (auto& key : keys) {
     prefixed_keys.push_back(joinKey(key));
   }
@@ -93,6 +98,7 @@ void PrefixStore::multiSet(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<uint8_t>>& values) {
   std::vector<std::string> prefixed_keys;
+  prefixed_keys.reserve(keys.size());
   for (auto& key : keys) {
     prefixed_keys.push_back(joinKey(key));
   }
@@ -102,6 +108,20 @@ void PrefixStore::multiSet(
 // Returns true if this store support append, multiGet and multiSet
 bool PrefixStore::hasExtendedApi() const {
   return store_->hasExtendedApi();
+}
+
+void PrefixStore::queuePush(
+    const std::string& key,
+    const std::vector<uint8_t>& value) {
+  store_->queuePush(joinKey(key), value);
+}
+
+std::vector<uint8_t> PrefixStore::queuePop(const std::string& key, bool block) {
+  return store_->queuePop(joinKey(key), block);
+}
+
+int64_t PrefixStore::queueLen(const std::string& key) {
+  return store_->queueLen(joinKey(key));
 }
 
 c10::intrusive_ptr<Store> PrefixStore::getUnderlyingStore() {

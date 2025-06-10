@@ -1,11 +1,13 @@
+# mypy: allow-untyped-defs
 import itertools
-import warnings
-from typing import Protocol, Optional, Type, Any
+from typing import Any, Optional, Protocol
 
 import torch
-from ..parameter import is_lazy
+from torch.nn.parameter import is_lazy
 
-__all__ = ['LazyModuleMixin']
+
+__all__ = ["LazyModuleMixin"]
+
 
 class _LazyProtocol(Protocol):
     """This class is used to avoid errors with mypy checks for the attributes in a mixin.
@@ -20,8 +22,15 @@ class _LazyProtocol(Protocol):
         ...
 
     def _lazy_load_hook(
-            self, state_dict, prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs):
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
         ...
 
     def _get_name(self):
@@ -77,7 +86,7 @@ class LazyModuleMixin:
 
     >>> # xdoctest: +SKIP
     >>> class LazyMLP(torch.nn.Module):
-    ...    def __init__(self):
+    ...    def __init__(self) -> None:
     ...        super().__init__()
     ...        self.fc1 = torch.nn.LazyLinear(10)
     ...        self.relu1 = torch.nn.ReLU()
@@ -92,7 +101,7 @@ class LazyModuleMixin:
     >>> lazy_mlp = LazyMLP()
     >>> # transforms the network's device and dtype
     >>> # NOTE: these transforms can and should be applied after construction and before any 'dry runs'
-    >>> lazy_mlp = lazy_mlp.cuda().double()
+    >>> lazy_mlp = lazy_mlp.cuda()
     >>> lazy_mlp
     LazyMLP( (fc1): LazyLinear(in_features=0, out_features=10, bias=True)
       (relu1): ReLU()
@@ -110,7 +119,7 @@ class LazyModuleMixin:
       (relu2): ReLU()
     )
     >>> # attaches an optimizer, since parameters can now be used as usual
-    >>> optim = torch.optim.SGD(mlp.parameters(), lr=0.01)
+    >>> optim = torch.optim.SGD(lazy_mlp.parameters(), lr=0.01)
 
     A final caveat when using lazy modules is that the order of initialization of a network's
     parameters may change, since the lazy modules are always initialized after other modules.
@@ -127,13 +136,10 @@ class LazyModuleMixin:
     >>> lazy_mlp = LazyMLP()
     >>> # The state dict shows the uninitialized parameters
     >>> lazy_mlp.state_dict()
-    OrderedDict([('fc1.weight', Uninitialized parameter),
-                 ('fc1.bias',
-                  tensor([-1.8832e+25,  4.5636e-41, -1.8832e+25,  4.5636e-41, -6.1598e-30,
-                           4.5637e-41, -1.8788e+22,  4.5636e-41, -2.0042e-31,  4.5637e-41])),
-                 ('fc2.weight', Uninitialized parameter),
-                 ('fc2.bias', tensor([0.0019]))])
-
+    OrderedDict({'fc1.weight': <UninitializedParameter>,
+                 'fc1.bias': <UninitializedParameter>,
+                 'fc2.weight': <UninitializedParameter>,
+                 'fc2.bias': <UninitializedParameter>})
 
     Lazy modules can load regular :class:`torch.nn.Parameter` s (i.e. you can serialize/deserialize
     initialized LazyModules and they will remain initialized)
@@ -171,15 +177,15 @@ class LazyModuleMixin:
 
     # modules inheriting from this will change their __class__ to the specified
     # one after they are fully initialized
-    cls_to_become: Optional[Type[Any]] = None
+    cls_to_become: Optional[type[Any]] = None
 
     def __init__(self: _LazyProtocol, *args, **kwargs):
         # Mypy doesnt like this super call in a mixin
         super().__init__(*args, **kwargs)  # type: ignore[misc]
         self._load_hook = self._register_load_state_dict_pre_hook(self._lazy_load_hook)
-        self._initialize_hook = self.register_forward_pre_hook(self._infer_parameters, with_kwargs=True)
-        warnings.warn('Lazy modules are a new feature under heavy development '
-                      'so changes to the API or functionality can happen at any moment.')
+        self._initialize_hook = self.register_forward_pre_hook(
+            self._infer_parameters, with_kwargs=True
+        )
 
     def _save_to_state_dict(self: _LazyProtocol, destination, prefix, keep_vars):
         # This should be ideally implemented as a hook,
@@ -197,8 +203,15 @@ class LazyModuleMixin:
                 destination[prefix + name] = buf
 
     def _lazy_load_hook(
-            self: _LazyProtocol, state_dict, prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs):
+        self: _LazyProtocol,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
         """load_state_dict pre-hook function for lazy buffers and parameters.
 
         The purpose of this hook is to adjust the current state and/or
@@ -208,7 +221,9 @@ class LazyModuleMixin:
         See comment in ``torch.nn.Module._register_load_state_dict_pre_hook``
         for the details of the hook specification.
         """
-        for name, param in itertools.chain(self._parameters.items(), self._buffers.items()):
+        for name, param in itertools.chain(
+            self._parameters.items(), self._buffers.items()
+        ):
             key = prefix + name
             if key in state_dict and param is not None:
                 input_param = state_dict[key]
@@ -225,7 +240,9 @@ class LazyModuleMixin:
         This adds an interface to isolate parameter initialization from the
         forward pass when doing parameter shape inference.
         """
-        raise NotImplementedError(f'initialize_parameters is not implemented for {self.__class__.__name__}')
+        raise NotImplementedError(
+            f"initialize_parameters is not implemented for {self.__class__.__name__}"
+        )
 
     def has_uninitialized_params(self: _LazyProtocol):
         r"""Check if a module has parameters that are not initialized."""
@@ -238,6 +255,8 @@ class LazyModuleMixin:
                 return True
         return False
 
+    # torchrec tests the code consistency with the following code
+    # fmt: off
     def _infer_parameters(self: _LazyProtocol, module, args, kwargs=None):
         r"""Infers the size and initializes the parameters according to the provided input batch.
 
@@ -258,8 +277,10 @@ class LazyModuleMixin:
         delattr(module, '_load_hook')
         if module.cls_to_become is not None:
             module.__class__ = module.cls_to_become
-
+    # fmt: on
 
     def _replicate_for_data_parallel(self: _LazyProtocol):
-        raise RuntimeError('Modules with uninitialized parameters can\'t be used with `DataParallel`. '
-                           'Run a dummy forward pass to correctly initialize the modules')
+        raise RuntimeError(
+            "Modules with uninitialized parameters can't be used with `DataParallel`. "
+            "Run a dummy forward pass to correctly initialize the modules"
+        )

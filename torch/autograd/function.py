@@ -1,9 +1,11 @@
+# mypy: allow-untyped-defs
 import functools
 import inspect
 import itertools
 import warnings
 from collections import OrderedDict
-from typing import Any, List, Optional, Tuple
+from typing import Any, Optional
+from typing_extensions import deprecated
 
 import torch
 import torch._C as _C
@@ -12,13 +14,13 @@ import torch.utils.hooks as hooks
 from torch._C import _functions
 from torch._functorch.autograd_function import custom_function_call
 
+
 __all__ = [
     "FunctionCtx",
     "BackwardCFunction",
     "FunctionMeta",
     "Function",
     "once_differentiable",
-    "traceable",
     "InplaceFunction",
     "NestedIOFunction",
 ]
@@ -33,13 +35,14 @@ class FunctionCtx:
     def save_for_backward(self, *tensors: torch.Tensor):
         r"""Save given tensors for a future call to :func:`~Function.backward`.
 
-        ``save_for_backward`` should be called at most once, only from inside the
-        :func:`forward` method, and only with tensors.
+        ``save_for_backward`` should be called at most once, in either the
+        :func:`setup_context` or :func:`forward` methods, and only with tensors.
 
         All tensors intended to be used in the backward pass should be saved
         with ``save_for_backward`` (as opposed to directly on ``ctx``) to prevent
         incorrect gradients and memory leaks, and enable the application of saved
         tensor hooks. See :class:`torch.autograd.graph.saved_tensors_hooks`.
+        See :ref:`extending-autograd` for more details.
 
         Note that if intermediary tensors, tensors that are neither inputs
         nor outputs of :func:`forward`, are saved for backward, your custom Function
@@ -61,6 +64,7 @@ class FunctionCtx:
         See :ref:`extending-autograd` for more details on how to use this method.
 
         Example::
+
             >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_AUTOGRAD)
             >>> class Func(Function):
             >>>     @staticmethod
@@ -92,8 +96,9 @@ class FunctionCtx:
     def save_for_forward(self, *tensors: torch.Tensor):
         r"""Save given tensors for a future call to :func:`~Function.jvp`.
 
-        ``save_for_forward`` should be only called once, from inside the :func:`forward`
-        method, and only be called with tensors.
+        ``save_for_forward`` should be called at most once, in either the
+        :func:`setup_context` or :func:`forward` methods, and all arguments
+        should be tensors.
 
         In :func:`jvp`, saved objects can be accessed through the :attr:`saved_tensors`
         attribute.
@@ -103,6 +108,7 @@ class FunctionCtx:
         See :ref:`extending-autograd` for more details on how to use this method.
 
         Example::
+
             >>> # xdoctest: +SKIP
             >>> class Func(torch.autograd.Function):
             >>>     @staticmethod
@@ -145,8 +151,8 @@ class FunctionCtx:
     def mark_dirty(self, *args: torch.Tensor):
         r"""Mark given tensors as modified in an in-place operation.
 
-        **This should be called at most once, only from inside the**
-        :func:`forward` **method, and all arguments should be inputs.**
+        This should be called at most once, in either the :func:`setup_context`
+        or :func:`forward` methods, and all arguments should be inputs.
 
         Every tensor that's been modified in-place in a call to :func:`forward`
         should be given to this function, to ensure correctness of our checks.
@@ -179,18 +185,20 @@ class FunctionCtx:
         """
         self.dirty_tensors = args
 
+    @deprecated(
+        "`mark_shared_storage` is deprecated. "
+        "Tensors with shared storages are automatically tracked. "
+        "Note that calls to `set_()` are not tracked",
+        category=FutureWarning,
+    )
     def mark_shared_storage(self, *pairs):
-        warnings.warn(
-            "mark_shared_storage is deprecated. "
-            "Tensors with shared storages are automatically tracked. Note "
-            "that calls to `set_()` are not tracked"
-        )
+        pass
 
     def mark_non_differentiable(self, *args: torch.Tensor):
         r"""Mark outputs as non-differentiable.
 
-        **This should be called at most once, only from inside the**
-        :func:`forward` **method, and all arguments should be tensor outputs.**
+        This should be called at most once, in either the :func:`setup_context`
+        or :func:`forward` methods, and all arguments should be tensor outputs.
 
         This will mark outputs as not requiring gradients, increasing the
         efficiency of backward computation. You still need to accept a gradient
@@ -221,12 +229,14 @@ class FunctionCtx:
     def set_materialize_grads(self, value: bool):
         r"""Set whether to materialize grad tensors. Default is ``True``.
 
-        **This should be called only from inside the** :func:`forward` **method**
+        This should be called only from either the :func:`setup_context` or
+        :func:`forward` methods.
 
         If ``True``, undefined grad tensors will be expanded to tensors full of zeros
         prior to calling the :func:`backward` and :func:`jvp` methods.
 
         Example::
+
             >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_AUTOGRAD)
             >>> class SimpleFunc(Function):
             >>>     @staticmethod
@@ -311,23 +321,6 @@ class BackwardCFunction(_C._FunctionBase, FunctionCtx, _HookMixin):
         return self._forward_cls._compiled_autograd_key(self)  # type: ignore[attr-defined]
 
 
-def _warn_traceable_deprecated():
-    warnings.warn(
-        "The is_traceable field on torch.autograd.Function is deprecated "
-        "and will be removed in PyTorch 2.4.",
-        stacklevel=3,
-    )
-
-
-class _IsTraceableWarning:
-    def __init__(self, value):
-        self.value = value
-
-    def __get__(self, obj, klass=None):
-        _warn_traceable_deprecated()
-        return self.value
-
-
 class FunctionMeta(type):
     """Function metaclass.
 
@@ -342,28 +335,12 @@ class FunctionMeta(type):
             name + "Backward", (BackwardCFunction,), {"_forward_cls": cls}
         )
         backward_fn._autograd_function_id = next(AUTOGRAD_FUNCTION_COUNTER)  # type: ignore[attr-defined]
-        backward_fn._compiled_autograd_should_lift = attrs.get(  # type: ignore[attr-defined]
-            "_compiled_autograd_should_lift", True
-        )
+        backward_fn._bw_module = None  # type: ignore[attr-defined]
+        if getattr(cls, "_lazy_backward_info", None):
+            backward_fn._bw_module = cls._lazy_backward_info.bw_module  # type: ignore[attr-defined]
         cls._backward_cls = backward_fn
 
-        if "is_traceable" in attrs:
-            if attrs["is_traceable"] is True:
-                _warn_traceable_deprecated()
-                # already emitted warning, no need to install _IsTraceableWarning
-            else:
-                cls.is_traceable = _IsTraceableWarning(attrs.pop("is_traceable"))
-
         super().__init__(name, bases, attrs)
-
-    def __setattr__(cls, name, value):
-        if name == "is_traceable" and value is True:
-            warnings.warn(
-                "The is_traceable field on torch.autograd.Function is deprecated "
-                "and will be removed in PyTorch 2.4.",
-                stacklevel=2,
-            )
-        return super().__setattr__(name, value)
 
 
 class _SingleLevelFunction(
@@ -416,7 +393,7 @@ class _SingleLevelFunction(
         )
 
     @staticmethod
-    def setup_context(ctx: Any, inputs: Tuple[Any, ...], output: Any) -> Any:
+    def setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> Any:
         r"""There are two ways to define the forward pass of an autograd.Function.
 
         Either:
@@ -523,9 +500,8 @@ class Function(_SingleLevelFunction):
     """
 
     def __init__(self, *args, **kwargs):
-        cls = self.__class__
         warnings.warn(
-            f"{cls} should not be instantiated. Methods on autograd functions"
+            f"{self.__class__} should not be instantiated. Methods on autograd functions "
             "are all static, so you should invoke them on the class itself. "
             "Instantiating an autograd function will raise an "
             "error in a future version of PyTorch.",
@@ -539,9 +515,6 @@ class Function(_SingleLevelFunction):
             "Please use new-style autograd function with static forward method. "
             "(Example: https://pytorch.org/docs/stable/autograd.html#torch.autograd.Function)"
         )
-
-    # for the tracer
-    is_traceable = False
 
     """
     Bool that specifies if PyTorch should attempt to autogenerate
@@ -596,7 +569,7 @@ class Function(_SingleLevelFunction):
 
             return bound_args.args
 
-        is_setup_ctx_defined = cls.setup_context != _SingleLevelFunction.setup_context
+        is_setup_ctx_defined = _is_setup_context_defined(cls.setup_context)
         if is_setup_ctx_defined:
             args = bind_default_args(cls.forward, *args, **kwargs)
 
@@ -618,6 +591,10 @@ class Function(_SingleLevelFunction):
     @staticmethod
     def _compiled_autograd_key(ctx):
         return (ctx._autograd_function_id,)
+
+
+def _is_setup_context_defined(fn):
+    return fn != _SingleLevelFunction.setup_context
 
 
 def once_differentiable(fn):
@@ -665,26 +642,6 @@ def once_differentiable(fn):
         return err_fn(*[fake_requires_grad(v) for v in outputs])
 
     return wrapper
-
-
-def traceable(fn_cls):
-    r"""Mark Function as traceable for the JIT.
-
-    Traceable functions have additional restrictions - they can't pass any
-    data-dependent values to backward (e.g. Prod passes the output, which makes
-    it non-traceable), and their backward should be implemented entirely in terms
-    of operations on autograd Tensors in all cases.
-
-    DON'T USE THIS DECORATOR. IT IS FOR INTERNAL USE ONLY AND SHOULD BE HANDLED WITH
-    CARE (or can give incorrect results otherwise).
-    """
-    warnings.warn(
-        "torch.autograd.function.traceable is deprecated "
-        "and will be removed in PyTorch 2.4.",
-        stacklevel=2,
-    )
-    fn_cls.is_traceable = True
-    return fn_cls
 
 
 class InplaceFunction(Function):
@@ -769,7 +726,7 @@ def _unflatten(input, proto):
     # unflatten a list or tuple input into a nested list/tuple structure
     # specified by proto
     def unflatten_helper(input, proto):
-        res: List[Optional[torch.Tensor]] = []
+        res: list[Optional[torch.Tensor]] = []
         if hasattr(proto, "_jit_wrap"):
             return proto._jit_wrap(input)
         if not isinstance(proto, (list, tuple)):
@@ -819,7 +776,6 @@ class NestedIOFunction(Function):
         self._nested_input = input
         flat_input = tuple(_iter_tensors(input))
         flat_output = super()._do_forward(*flat_input)  # type: ignore[misc]
-        nested_output = self._nested_output
         nested_tensors = _unflatten(flat_output, self._nested_output)
         return nested_tensors
 

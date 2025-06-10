@@ -3,12 +3,13 @@
 import json
 import os
 import tempfile
-from typing import Any, Dict, List
+from typing import Any
 from unittest import main, mock, TestCase
 
 import yaml
 from filter_test_configs import (
     filter,
+    filter_selected_test_configs,
     get_labels,
     mark_unstable_jobs,
     parse_reenabled_issues,
@@ -100,30 +101,6 @@ MOCKED_DISABLED_UNSTABLE_JOBS = {
         "linux-binary-manywheel",
         "manywheel-py3_8-cuda11_8-build",
         "",
-    ],
-    "inductor / cuda12.1-py3.10-gcc9-sm86 / test (inductor)": [
-        "pytorchbot",
-        "107079",
-        "https://github.com/pytorch/pytorch/issues/107079",
-        "inductor",
-        "cuda12.1-py3.10-gcc9-sm86",
-        "test (inductor)",
-    ],
-    "inductor / cuda12.1-py3.10-gcc9-sm86 / test (inductor_huggingface)": [
-        "pytorchbot",
-        "109153",
-        "https://github.com/pytorch/pytorch/issues/109153",
-        "inductor",
-        "cuda12.1-py3.10-gcc9-sm86",
-        "test (inductor_huggingface)",
-    ],
-    "inductor / cuda12.1-py3.10-gcc9-sm86 / test (inductor_huggingface_dynamic)": [
-        "pytorchbot",
-        "109154",
-        "https://github.com/pytorch/pytorch/issues/109154",
-        "inductor",
-        "cuda12.1-py3.10-gcc9-sm86",
-        "test (inductor_huggingface_dynamic)",
     ],
 }
 
@@ -315,8 +292,53 @@ class TestConfigFilter(TestCase):
             )
             self.assertEqual(case["expected"], json.dumps(filtered_test_matrix))
 
+    def test_filter_selected_test_configs(self) -> None:
+        testcases = [
+            {
+                "test_matrix": '{include: [{config: "default"}]}',
+                "selected_test_configs": "",
+                "expected": '{"include": [{"config": "default"}]}',
+                "description": "No selected test configs",
+            },
+            {
+                "test_matrix": '{include: [{config: "default"}]}',
+                "selected_test_configs": "foo",
+                "expected": '{"include": []}',
+                "description": "A different test config is selected",
+            },
+            {
+                "test_matrix": '{include: [{config: "default"}]}',
+                "selected_test_configs": "foo, bar",
+                "expected": '{"include": []}',
+                "description": "A different set of test configs is selected",
+            },
+            {
+                "test_matrix": '{include: [{config: "default"}]}',
+                "selected_test_configs": "foo, bar,default",
+                "expected": '{"include": [{"config": "default"}]}',
+                "description": "One of the test config is selected",
+            },
+            {
+                "test_matrix": '{include: [{config: "default"}, {config: "bar"}]}',
+                "selected_test_configs": "foo, bar,Default",
+                "expected": '{"include": [{"config": "default"}, {"config": "bar"}]}',
+                "description": "Several test configs are selected",
+            },
+        ]
+
+        for case in testcases:
+            selected_test_configs = {
+                v.strip().lower()
+                for v in case["selected_test_configs"].split(",")
+                if v.strip()
+            }
+            filtered_test_matrix = filter_selected_test_configs(
+                yaml.safe_load(case["test_matrix"]), selected_test_configs
+            )
+            self.assertEqual(case["expected"], json.dumps(filtered_test_matrix))
+
     def test_set_periodic_modes(self) -> None:
-        testcases: List[Dict[str, str]] = [
+        testcases: list[dict[str, str]] = [
             {
                 "job_name": "a CI job",
                 "test_matrix": "{include: []}",
@@ -591,37 +613,6 @@ class TestConfigFilter(TestCase):
                 "expected": '{"include": [{"config": "default", "unstable": "unstable"}]}',
                 "description": "Both binary build and test jobs are unstable",
             },
-            {
-                "workflow": "inductor",
-                "job_name": "cuda12.1-py3.10-gcc9-sm86 / build",
-                "test_matrix": """
-                    { include: [
-                        { config: "inductor" },
-                        { config: "inductor_huggingface", shard: 1 },
-                        { config: "inductor_huggingface", shard: 2 },
-                        { config: "inductor_timm", shard: 1 },
-                        { config: "inductor_timm", shard: 2 },
-                        { config: "inductor_torchbench" },
-                        { config: "inductor_huggingface_dynamic" },
-                        { config: "inductor_torchbench_dynamic" },
-                        { config: "inductor_distributed" },
-                    ]}
-                """,
-                "expected": """
-                    { "include": [
-                        { "config": "inductor", "unstable": "unstable" },
-                        { "config": "inductor_huggingface", "shard": 1, "unstable": "unstable" },
-                        { "config": "inductor_huggingface", "shard": 2, "unstable": "unstable" },
-                        { "config": "inductor_timm", "shard": 1 },
-                        { "config": "inductor_timm", "shard": 2 },
-                        { "config": "inductor_torchbench" },
-                        { "config": "inductor_huggingface_dynamic", "unstable": "unstable" },
-                        { "config": "inductor_torchbench_dynamic" },
-                        { "config": "inductor_distributed" }
-                    ]}
-                """,
-                "description": "Marking multiple unstable configurations",
-            },
         ]
 
         for case in testcases:
@@ -637,22 +628,26 @@ class TestConfigFilter(TestCase):
         def _gen_expected_string(
             keep_going: bool = False,
             ci_verbose_test_logs: bool = False,
+            ci_test_showlocals: bool = False,
             ci_no_test_timeout: bool = False,
             ci_no_td: bool = False,
+            ci_td_distributed: bool = False,
             is_unstable: bool = False,
             reenabled_issues: str = "",
         ) -> str:
             return (
                 f"keep-going={keep_going}\n"
                 f"ci-verbose-test-logs={ci_verbose_test_logs}\n"
+                f"ci-test-showlocals={ci_test_showlocals}\n"
                 f"ci-no-test-timeout={ci_no_test_timeout}\n"
                 f"ci-no-td={ci_no_td}\n"
+                f"ci-td-distributed={ci_td_distributed}\n"
                 f"is-unstable={is_unstable}\n"
                 f"reenabled-issues={reenabled_issues}\n"
             )
 
         mocked_subprocess.return_value = b""
-        testcases: List[Dict[str, Any]] = [
+        testcases: list[dict[str, Any]] = [
             {
                 "labels": {},
                 "test_matrix": '{include: [{config: "default"}]}',
@@ -684,6 +679,21 @@ class TestConfigFilter(TestCase):
                     ci_verbose_test_logs=True, ci_no_test_timeout=True
                 ),
                 "description": "No pipe logs label and no test timeout in PR body",
+            },
+            {
+                "labels": {"ci-test-showlocals"},
+                "test_matrix": '{include: [{config: "default"}]}',
+                "job_name": "A job name",
+                "expected": _gen_expected_string(ci_test_showlocals=True),
+                "description": "Has ci-test-showlocals",
+            },
+            {
+                "labels": {},
+                "test_matrix": '{include: [{config: "default"}]}',
+                "job_name": "A job name",
+                "pr_body": "[ci-test-showlocals]",
+                "expected": _gen_expected_string(ci_test_showlocals=True),
+                "description": "ci-test-showlocals in body",
             },
             {
                 "labels": {"ci-no-test-timeout"},
@@ -797,7 +807,7 @@ class TestConfigFilter(TestCase):
         # test bad things
         pr_body = (
             "fixes189 fixeshttps://github.com/pytorch/pytorch/issues/75123 "
-            "closedhttps://githubcom/pytorch/pytorch/issues/75123"
+            "closedhttps://githubcom/pytorch/pytorch/issues/75123"  # @lint-ignore
             "fix 234, fixes # 45, fixing #123, close 234, closes#45, closing #123 resolve 234, "
             "resolves  #45, resolving #123"
         )

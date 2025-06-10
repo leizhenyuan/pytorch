@@ -1,9 +1,10 @@
+# mypy: allow-untyped-defs
 import json
 import logging
 import os
 import struct
 
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 import torch
 import numpy as np
@@ -73,13 +74,13 @@ def int_to_half(i: int) -> float:
     buf = struct.pack("i", i)
     return struct.unpack("f", buf)[0]
 
-def _tensor_to_half_val(t: torch.Tensor) -> List[int]:
+def _tensor_to_half_val(t: torch.Tensor) -> list[int]:
     return [half_to_int(x) for x in t.flatten().tolist()]
 
-def _tensor_to_complex_val(t: torch.Tensor) -> List[float]:
+def _tensor_to_complex_val(t: torch.Tensor) -> list[float]:
     return torch.view_as_real(t).flatten().tolist()
 
-def _tensor_to_list(t: torch.Tensor) -> List[Any]:
+def _tensor_to_list(t: torch.Tensor) -> list[Any]:
     return t.flatten().tolist()
 
 # type maps: torch.Tensor type -> (protobuf type, protobuf val field)
@@ -142,7 +143,8 @@ def _draw_single_box(
     if display_str:
         text_bottom = bottom
         # Reverse list and print from bottom to top.
-        text_width, text_height = font.getsize(display_str)
+        _left, _top, _right, _bottom = font.getbbox(display_str)
+        text_width, text_height = _right - _left, _bottom - _top
         margin = np.ceil(0.05 * text_height)
         draw.rectangle(
             [
@@ -396,7 +398,7 @@ def tensor_proto(tag, tensor):
     """Outputs a `Summary` protocol buffer containing the full tensor.
     The generated Summary has a Tensor.proto containing the input Tensor.
     Args:
-      name: A name for the generated node. Will also serve as the series name in
+      tag: A name for the generated node. Will also serve as the series name in
         TensorBoard.
       tensor: Tensor to be converted to protobuf
     Returns:
@@ -620,10 +622,7 @@ def make_image(tensor, rescale=1, rois=None, labels=None):
     image = Image.fromarray(tensor)
     if rois is not None:
         image = draw_boxes(image, rois, labels=labels)
-    try:
-        ANTIALIAS = Image.Resampling.LANCZOS
-    except AttributeError:
-        ANTIALIAS = Image.ANTIALIAS
+    ANTIALIAS = Image.Resampling.LANCZOS
     image = image.resize((scaled_width, scaled_height), ANTIALIAS)
     import io
 
@@ -666,7 +665,7 @@ def make_video(tensor, fps):
         return
     import tempfile
 
-    t, h, w, c = tensor.shape
+    _t, h, w, c = tensor.shape
 
     # encode sequence of images into gif string
     clip = mpy.ImageSequenceClip(list(tensor), fps=fps)
@@ -727,9 +726,9 @@ def custom_scalars(layout):
     categories = []
     for k, v in layout.items():
         charts = []
-        for chart_name, chart_meatadata in v.items():
-            tags = chart_meatadata[1]
-            if chart_meatadata[0] == "Margin":
+        for chart_name, chart_metadata in v.items():
+            tags = chart_metadata[1]
+            if chart_metadata[0] == "Margin":
                 assert len(tags) == 3
                 mgcc = layout_pb2.MarginChartContent(
                     series=[

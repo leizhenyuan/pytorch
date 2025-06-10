@@ -1,9 +1,10 @@
+# mypy: allow-untyped-defs
 from __future__ import annotations
 
 import copy
 import functools
-
-from typing import Any, Callable, Dict, List, Optional, Set
+import typing_extensions
+from typing import Any, Callable, Optional, TYPE_CHECKING
 
 import torch
 import torch._dynamo as torchdynamo
@@ -20,11 +21,8 @@ from torch.ao.quantization.observer import (
     PerChannelMinMaxObserver,
     PlaceholderObserver,
 )
-
-from torch.ao.quantization.qconfig import _ObserverOrFakeQuantizeConstructor
-
 from torch.ao.quantization.quantizer import QuantizationSpec, Quantizer
-
+from torch.ao.quantization.quantizer.utils import _get_module_name_filter
 from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import (
     _convert_scalars_to_attrs,
     OP_TO_ANNOTATOR,
@@ -33,8 +31,12 @@ from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import (
     propagate_annotation,
     QuantizationConfig,
 )
+from torch.fx._compatibility import compatibility
 
-from torch.fx import Node
+
+if TYPE_CHECKING:
+    from torch.ao.quantization.qconfig import _ObserverOrFakeQuantizeConstructor
+    from torch.fx import Node
 
 
 __all__ = [
@@ -49,7 +51,7 @@ def _get_dynamo_graph(function: Callable, inputs) -> torch.fx.Graph:
     return gm.graph
 
 
-def _get_linear_patterns(input_size: List[int]):
+def _get_linear_patterns(input_size: list[int]):
     in_channels = input_size[-1]
     out_channels = 8  # hard coding but this should not matter
     weight = torch.ones((out_channels, in_channels))
@@ -64,8 +66,8 @@ def _get_linear_patterns(input_size: List[int]):
     return [pattern_w_bias, pattern_wo_bias]
 
 
-def _supported_symmetric_quantized_operators() -> Dict[str, List[OperatorPatternType]]:
-    supported_operators: Dict[str, List[OperatorPatternType]] = {
+def _supported_symmetric_quantized_operators() -> dict[str, list[OperatorPatternType]]:
+    supported_operators: dict[str, list[OperatorPatternType]] = {
         # Both conv and linear should be able to handle relu + hardtanh fusion since
         # those are clamp ops
         "conv2d": [
@@ -76,7 +78,6 @@ def _supported_symmetric_quantized_operators() -> Dict[str, List[OperatorPattern
         ],
         "linear": [[torch.nn.Linear], [F.linear]],
         "add": [[torch.add]],
-        "max_pool2d": [[torch.nn.MaxPool2d], [F.max_pool2d]],
         "adaptive_avg_pool2d": [
             [torch.nn.AdaptiveAvgPool2d],
             [F.adaptive_avg_pool2d],
@@ -85,8 +86,8 @@ def _supported_symmetric_quantized_operators() -> Dict[str, List[OperatorPattern
     return copy.deepcopy(supported_operators)
 
 
-def _get_supported_symmetric_config_and_operators() -> List[OperatorConfig]:
-    supported_config_and_operators: List[OperatorConfig] = []
+def _get_supported_symmetric_config_and_operators() -> list[OperatorConfig]:
+    supported_config_and_operators: list[OperatorConfig] = []
     for quantization_config in [
         get_symmetric_quantization_config(),
         get_symmetric_quantization_config(is_qat=True),
@@ -94,10 +95,10 @@ def _get_supported_symmetric_config_and_operators() -> List[OperatorConfig]:
         get_symmetric_quantization_config(is_per_channel=True, is_qat=True),
     ]:
         ops = _supported_symmetric_quantized_operators()
-        for pattern_list in ops.values():
-            supported_config_and_operators.append(
-                OperatorConfig(quantization_config, pattern_list)
-            )
+        supported_config_and_operators.extend(
+            OperatorConfig(quantization_config, pattern_list)
+            for pattern_list in ops.values()
+        )
     return copy.deepcopy(supported_config_and_operators)
 
 
@@ -111,7 +112,7 @@ def get_symmetric_quantization_config(
     weight_qmin: int = -127,
     weight_qmax: int = 127,
 ):
-    extra_args: Dict[str, Any] = {"eps": 2**-12}
+    extra_args: dict[str, Any] = {"eps": 2**-12}
     if is_qat:
         if is_dynamic:
             act_observer_or_fake_quant_ctr = FakeQuantize
@@ -149,7 +150,7 @@ def get_symmetric_quantization_config(
     elif is_per_channel:
         weight_observer_or_fake_quant_ctr = PerChannelMinMaxObserver
 
-    extra_args: Dict[str, Any] = {"eps": 2**-12}
+    extra_args: dict[str, Any] = {"eps": 2**-12}
     if is_qat:
         if weight_qscheme == torch.per_tensor_symmetric:
             extra_args["observer"] = MovingAverageMinMaxObserver
@@ -187,34 +188,8 @@ def get_symmetric_quantization_config(
     return quantization_config
 
 
-def _get_supported_config_and_operators() -> List[OperatorConfig]:
+def _get_supported_config_and_operators() -> list[OperatorConfig]:
     return _get_supported_symmetric_config_and_operators()
-
-
-def _get_module_name_filter(module_name: str):
-    """Get the module_name_filter function for a given module name, the filter accepts
-    a node and checks if the node comes from a module that has certain module name
-
-    For example:
-        node: linear_op = call_function[...](...)  # comes from a module with name blocks.sub.linear1
-
-
-    >> module_name_filter = _get_module_name_filter("blocks.sub")
-    >> print(module_name_filter(node))
-    True  # the node is from "blocks.sub" based on the fully qualified name "blocks.sub.linear1"
-    """
-
-    def module_name_filter(n: Node) -> bool:
-        # example: {
-        #    'L__self___sub': ("L['self'].sub", <class '....Sub'>),
-        #    'L__self___sub_linear': ("L['self'].sub.linear", <class 'torch.nn.modules.linear.Linear'>)
-        # }
-        # get_attr nodes doesn't have nn_module_stack?
-        nn_module_stack = n.meta.get("nn_module_stack", {})
-        names = [n[len("L['self'].") :] for n, klass in nn_module_stack.values()]
-        return module_name in names
-
-    return module_name_filter
 
 
 def _get_module_type_filter(tp: Callable):
@@ -230,20 +205,28 @@ def _get_module_type_filter(tp: Callable):
     True  # the node is from the submodule `Sub` (same for `Block` and `Linear` as well)
     """
 
+    tp_str = tp.__module__ + "." + tp.__qualname__
+
     def module_type_filter(n: Node) -> bool:
         # example: {
         #     'L__self___sub': ("L['self'].sub", <class '....Sub'>),
         #     'L__self___sub_linear': ("L['self'].sub.linear", <class 'torch.nn.modules.linear.Linear'>)
         # }
         nn_module_stack = n.meta.get("nn_module_stack", {})
-        types = [t for _, t in nn_module_stack.values()]
-        return tp in types
+        types = []
+        for _, t in nn_module_stack.values():
+            # export() returns str, but older APIs (e.g. capture_pre_autograd_graph)
+            # return type. Handle both cases.
+            if isinstance(t, type):
+                t = t.__module__ + "." + t.__qualname__
+            types.append(t)
+        return tp_str in types
 
     return module_type_filter
 
 
 def _get_not_module_type_or_name_filter(
-    tp_list: List[Callable], module_name_list: List[str]
+    tp_list: list[Callable], module_name_list: list[str]
 ) -> Callable[[Node], bool]:
     module_type_filters = [_get_module_type_filter(tp) for tp in tp_list]
     module_name_list_filters = [_get_module_name_filter(m) for m in module_name_list]
@@ -254,11 +237,25 @@ def _get_not_module_type_or_name_filter(
     return not_module_type_or_name_filter
 
 
+@compatibility(is_backward_compatible=False)
+@typing_extensions.deprecated(
+    "XNNPACKQuantizer is deprecated! Please use xnnpack quantizer in "
+    "ExecuTorch (https://github.com/pytorch/executorch/tree/main/backends/xnnpack/quantizer) instead."
+)
 class XNNPACKQuantizer(Quantizer):
+    """
+    !!! DEPRECATED !!!
+    XNNPACKQuantizer is a marked as deprected. It will be removed in the future.
+    It has been moved to executorch.backends.xnnpack.quantizer.xnnpack_quantizer.XNNPACKQuantizer.
+    Please use the new quantizer instead.
+    """
+
     supported_config_and_operators = _get_supported_config_and_operators()
     STATIC_QAT_ONLY_OPS = [
         "conv_bn_relu",
         "conv_bn",
+        "conv_transpose_bn_relu",
+        "conv_transpose_bn",
     ]
 
     # static quantization ops (both PTQ and QAT)
@@ -268,10 +265,10 @@ class XNNPACKQuantizer(Quantizer):
         "linear",
         "conv_relu",
         "conv",
+        "conv_transpose_relu",
         "adaptive_avg_pool2d",
         # TODO: move this to BoltNNQuantizer?
         "gru_io_only",
-        "max_pool2d",
         "add_relu",
         "add",
         "mul_relu",
@@ -283,26 +280,26 @@ class XNNPACKQuantizer(Quantizer):
         "linear",
     ]
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.global_config: Optional[QuantizationConfig] = None
-        self.operator_type_config: Dict[
+        self.operator_type_config: dict[
             torch._ops.OpOverloadPacket, Optional[QuantizationConfig]
         ] = {}
-        self.module_type_config: Dict[Callable, Optional[QuantizationConfig]] = {}
-        self.module_name_config: Dict[str, Optional[QuantizationConfig]] = {}
+        self.module_type_config: dict[Callable, Optional[QuantizationConfig]] = {}
+        self.module_name_config: dict[str, Optional[QuantizationConfig]] = {}
 
     @classmethod
-    def get_supported_quantization_configs(cls) -> List[QuantizationConfig]:
-        op_configs: Set[QuantizationConfig] = set({})
-        for spec, _ in cls.supported_config_and_operators:
-            op_configs.add(spec)
+    def get_supported_quantization_configs(cls) -> list[QuantizationConfig]:
+        op_configs: set[QuantizationConfig] = {
+            spec for spec, _ in cls.supported_config_and_operators
+        }
         return list(op_configs)
 
     @classmethod
     def get_supported_operator_for_quantization_config(
         cls, quantization_config: Optional[QuantizationConfig]
-    ) -> List[OperatorPatternType]:
+    ) -> list[OperatorPatternType]:
         if quantization_config is None:
             all_ops = []
             for _, ops in cls.supported_config_and_operators:
@@ -449,5 +446,5 @@ class XNNPACKQuantizer(Quantizer):
         pass
 
     @classmethod
-    def get_supported_operators(cls) -> List[OperatorConfig]:
+    def get_supported_operators(cls) -> list[OperatorConfig]:
         return cls.supported_config_and_operators

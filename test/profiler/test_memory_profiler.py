@@ -3,12 +3,21 @@ import functools
 import gc
 import itertools as it
 import textwrap
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+import unittest
+from collections.abc import Iterator
+from typing import Callable, Optional
 
 import torch
 from torch._C._profiler import _EventType, _TensorMetadata
 from torch.profiler import _memory_profiler, _utils
-from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, TestCase
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_utils import (
+    ALLOW_XPU_PROFILING_TEST,
+    DEVICE_LIST_SUPPORT_PROFILING_TEST,
+    run_tests,
+    skipIfTorchDynamo,
+    TestCase,
+)
 from torch.utils import _pytree as pytree
 
 
@@ -66,7 +75,7 @@ class LazyLinear(torch.nn.Module):
 
 
 class RecordInputOutputDispatchMode(torch.utils._python_dispatch.TorchDispatchMode):
-    def __init__(self):
+    def __init__(self) -> None:
         self.results = []
 
     def mark_region(self, name: str):
@@ -103,7 +112,6 @@ class TestIdentifyGradients(TestCase):
         grad_tensor: torch.Tensor,
         parameter: Optional[torch.Tensor] = None,
     ) -> None:
-
         # This is not an exhaustive check, but for the purpose of unit testing
         # it is sufficient.
         def key_matches_tensor(key, tensor) -> bool:
@@ -219,7 +227,6 @@ class TestIdentifyGradients(TestCase):
         check(cold_start=False)
 
     def _test_extract_gradients_from_optimizer(self, set_to_none: bool) -> None:
-
         x = torch.ones((1,))
         w0 = torch.ones((1,), requires_grad=True)
         w1 = torch.ones((1,), requires_grad=True)
@@ -301,9 +308,9 @@ class TestDataFlow(TestCase):
     @staticmethod
     def formatSchemas(
         prof: torch.profiler.profile, indent: int = 12
-    ) -> Tuple[Tuple[str, Tuple[bool, ...]], ...]:
+    ) -> tuple[tuple[str, tuple[bool, ...]], ...]:
         tree = prof.profiler.kineto_results.experimental_event_tree()
-        out: List[Tuple[str, Tuple[bool, ...]]] = []
+        out: list[tuple[str, tuple[bool, ...]]] = []
         for node in _utils.traverse_dfs(tree):
             if node.tag == _EventType.TorchOp:
                 e = node.extra_fields
@@ -319,8 +326,8 @@ class TestDataFlow(TestCase):
 
     @staticmethod
     def _run_and_format_data_flow(
-        inputs: Dict[str, torch.Tensor],
-        f: Callable[..., Optional[Dict[str, torch.Tensor]]],
+        inputs: dict[str, torch.Tensor],
+        f: Callable[..., Optional[dict[str, torch.Tensor]]],
         indent: int = 12,
     ) -> str:
         with profile() as prof:
@@ -331,7 +338,7 @@ class TestDataFlow(TestCase):
         graph = memory_profile._data_flow_graph
         storage_to_id = {key.storage.ptr: key.id for key in graph._active_version}
 
-        lines: List[str] = []
+        lines: list[str] = []
         for name, t in it.chain(inputs.items(), outputs.items()):
             lines.append(f"{name + ':':<8} T{storage_to_id[t.storage().data_ptr()]}")
             if t.grad is not None:
@@ -344,7 +351,7 @@ class TestDataFlow(TestCase):
         for node in graph.flow_nodes:
             destroyed = {k for k, v in node._edges.items() if v.is_deletion}
 
-            inputs: List[str] = []
+            inputs: list[str] = []
             for key, (_, v) in node.inputs.items():
                 inputs.append(f"T{key.id}(v{v}{'*' if key in destroyed else ''})")
 
@@ -488,7 +495,7 @@ class TestDataFlow(TestCase):
             z = x.mul(y)
             return {"z": z.view_as(z)}
 
-        def f1(x, y):
+        def f1(x, y):  # noqa: F841
             with torch.no_grad():
                 return f0(x, y)
 
@@ -824,7 +831,7 @@ class TestMemoryProfilerE2E(TestCase):
     @staticmethod
     def _lookup_tensor_categories(
         t: torch.Tensor, memory_profile: _memory_profiler.MemoryProfile
-    ) -> Dict[_memory_profiler.TensorAndID, Optional[_memory_profiler.Category]]:
+    ) -> dict[_memory_profiler.TensorAndID, Optional[_memory_profiler.Category]]:
         storage = t.storage()
         if storage is None:
             raise ValueError("Cannot look up uninitialized Tensor.")
@@ -844,14 +851,19 @@ class TestMemoryProfilerE2E(TestCase):
             if key.storage.allocation_id == max(ids | {-1})
         }
 
-    def _run_and_check_parameters_and_gradients(self, inner_fn, model, grads_none: bool = False):
-
+    def _run_and_check_parameters_and_gradients(
+        self, inner_fn, model, grads_none: bool = False
+    ):
         with profile() as prof:
             inner_fn()
 
         memory_profile = prof._memory_profile()
 
-        def assert_category(t: torch.Tensor, category: _memory_profiler.Category, should_be_none: bool = False):
+        def assert_category(
+            t: torch.Tensor,
+            category: _memory_profiler.Category,
+            should_be_none: bool = False,
+        ):
             if should_be_none:
                 assert t is None, "tensor should be None but is not."
                 return
@@ -875,7 +887,7 @@ class TestMemoryProfilerE2E(TestCase):
             fn(lambda name: record_ops.mark_region(f"-- {name} ".ljust(105, "-")))
 
         memory_profile = prof._memory_profile()
-        ptr_pair_to_key: Dict[Tuple[int, int], _memory_profiler.TensorKey] = {}
+        ptr_pair_to_key: dict[tuple[int, int], _memory_profiler.TensorKey] = {}
         snapshot = memory_profile._category_snapshot()
 
         # Build map from observed live Tensors to the memory profiler's
@@ -908,7 +920,7 @@ class TestMemoryProfilerE2E(TestCase):
 
             return f"{target_key.storage.allocation_id} ({','.join(categories)})"
 
-        out: List[str] = []
+        out: list[str] = []
         for name, inputs, outputs in record_ops.results:
             if inputs or outputs:
                 # PyTorch ops
@@ -940,7 +952,9 @@ class TestMemoryProfilerE2E(TestCase):
         # If we profile the first step then gradients will not have been
         # created when we call `model.forward`, so if we don't call `.backward`
         # then gradients are never created.
-        self._run_and_check_parameters_and_gradients(inner_fn=fwd_only, model=model, grads_none=True)
+        self._run_and_check_parameters_and_gradients(
+            inner_fn=fwd_only, model=model, grads_none=True
+        )
 
         # On the first step we must rely on `AccumulateGrad`, since gradients
         # did not exist when `model.forward` was called.
@@ -1108,8 +1122,8 @@ class TestMemoryProfilerE2E(TestCase):
         w1 = torch.ones((1,), requires_grad=True)
 
         def step_fn(_):
-            x = torch.ones((2, 2))
-            y = torch.cat([x * w0, x * w1], dim=1)
+            x = torch.ones((2, 2))  # noqa: F841
+            y = torch.cat([x * w0, x * w1], dim=1)  # noqa: F841
 
         # NOTE: We expect that all unknown categories. This is simply a sanity
         #       check to ensure that we do not over-label.
@@ -1461,7 +1475,6 @@ class TestMemoryProfilerE2E(TestCase):
                 return f"{size / 1024:3.1f} kB"
             return f"{size // 1024} kB"
 
-
         # We generate sequential IDs for Tensors; however platforms vary
         # slightly in the exact computation executed. If this results in
         # tensor creation the IDs will be shifted and the unit test will fail.
@@ -1477,7 +1490,6 @@ class TestMemoryProfilerE2E(TestCase):
             f"{action.name.lower():<25}  {format_action(action, key, version):<25}  "
             f"{id_for_testing(key):>3}(v{version}) {format_size(size):>15}"
             for _, action, (key, version), size in prof._memory_profile().timeline
-
             # We generally don't care about tiny allocations during memory
             # profiling and they add a lot of noise to the unit test.
             if size > 1024
@@ -1547,16 +1559,24 @@ class TestMemoryProfilerE2E(TestCase):
             destroy                    ???                         29(v1)         1024 kB
             destroy                    GRADIENT                    16(v0)          128 kB
             destroy                    GRADIENT                    17(v0)            2 kB
-            destroy                    GRADIENT                    13(v0)         1024 kB""")
+            destroy                    GRADIENT                    13(v0)         1024 kB""",
+        )
 
-    def test_memory_timeline_no_id(self) -> None:
+
+@skipIfTorchDynamo("TorchDynamo changes Python calls that memory profiling relies on.")
+class TestMemoryProfilerTimeline(TestCase):
+    @unittest.skipIf(
+        torch.xpu.is_available(),
+        "The XPU Profiler will not cover this case for now. Will support it in next period.",
+    )
+    def test_memory_timeline_no_id(self, device) -> None:
         # On CPU the default behavior is to simply forward to malloc. That
         # means that when we free `x` the allocator doesn't actually know how
         # many bytes are in the allocation, and thus there's no point to
         # calling `c10::reportMemoryUsageToProfiler`. So in order to test that
-        # memory profiler processes this case correctly we need to use CUDA
+        # memory profiler processes this case correctly we need to use device
         # where we do always keep a record.
-        x = torch.ones((1024,), device="cuda" if torch.cuda.is_available() else "cpu")
+        x = torch.ones((1024,), device=device)
 
         with profile() as prof:
             # We never see `x` used so we don't know the storage is for a
@@ -1591,10 +1611,12 @@ class TestMemoryProfilerE2E(TestCase):
         actual = [(action, size) for _, action, _, size in memory_profile.timeline]
 
         # See above.
-        if not torch.cuda.is_available():
+        if device == "cpu":
             expected = expected[2:]
             for event in expected:
-                self.assertTrue(event in actual, f"event: {event} was not found in actual.")
+                self.assertTrue(
+                    event in actual, f"event: {event} was not found in actual."
+                )
         else:
             self.assertEqual(
                 actual,
@@ -1602,6 +1624,13 @@ class TestMemoryProfilerE2E(TestCase):
                 f"expected does not match actual: {actual}",
             )
 
+
+instantiate_device_type_tests(
+    TestMemoryProfilerTimeline,
+    globals(),
+    only_for=DEVICE_LIST_SUPPORT_PROFILING_TEST,
+    allow_xpu=ALLOW_XPU_PROFILING_TEST,
+)
 
 if __name__ == "__main__":
     run_tests()

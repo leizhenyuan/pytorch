@@ -16,7 +16,6 @@ import unittest
 from concurrent.futures import wait
 from concurrent.futures._base import ALL_COMPLETED
 from concurrent.futures.thread import ThreadPoolExecutor
-from typing import Dict, Set
 from unittest import mock
 
 from torch.distributed.elastic.multiprocessing.tail_log import TailLog
@@ -53,7 +52,9 @@ class TailLogTest(unittest.TestCase):
         }
 
         dst = io.StringIO()
-        tail = TailLog(name="writer", log_files=log_files, dst=dst, interval_sec=interval_sec).start()
+        tail = TailLog(
+            name="writer", log_files=log_files, dst=dst, interval_sec=interval_sec
+        ).start()
         # sleep here is intentional to ensure that the log tail
         # can gracefully handle and wait for non-existent log files
         time.sleep(interval_sec * 10)
@@ -70,7 +71,7 @@ class TailLogTest(unittest.TestCase):
         tail.stop()
 
         dst.seek(0)
-        actual: Dict[int, Set[int]] = {}
+        actual: dict[int, set[int]] = {}
 
         for line in dst.readlines():
             header, num = line.split(":")
@@ -121,7 +122,7 @@ class TailLogTest(unittest.TestCase):
         tail.stop()
         dst.seek(0)
 
-        headers: Set[str] = set()
+        headers: set[str] = set()
         for line in dst.readlines():
             header, _ = line.split(":")
             headers.add(header)
@@ -129,7 +130,6 @@ class TailLogTest(unittest.TestCase):
         for i in range(nprocs):
             self.assertIn(f"[worker{i}][{i}]", headers)
         self.assertTrue(tail.stopped())
-
 
     def test_tail_no_files(self):
         """
@@ -152,7 +152,7 @@ class TailLogTest(unittest.TestCase):
         self.assertTrue(tail.stopped())
         self.assertTrue(tail._threadpool._shutdown)
 
-    @mock.patch("torch.distributed.elastic.multiprocessing.tail_log.log")
+    @mock.patch("torch.distributed.elastic.multiprocessing.tail_log.logger")
     def test_tail_logfile_error_in_tail_fn(self, mock_logger):
         """
         Ensures that when there is an error in the tail_fn (the one that runs in the

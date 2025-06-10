@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: LOG015
 
 import json
 import logging
@@ -8,12 +9,13 @@ import subprocess
 import sys
 import warnings
 from enum import Enum
-from functools import lru_cache
+from functools import cache
 from logging import info
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Optional
 from urllib.request import Request, urlopen
 
 import yaml
+
 
 REENABLE_TEST_REGEX = "(?i)(Close(d|s)?|Resolve(d|s)?|Fix(ed|es)?) (#|https://github.com/pytorch/pytorch/issues/)([0-9]+)"
 
@@ -31,7 +33,7 @@ def is_cuda_or_rocm_job(job_name: Optional[str]) -> bool:
 
 # Supported modes when running periodically. Only applying the mode when
 # its lambda condition returns true
-SUPPORTED_PERIODICAL_MODES: Dict[str, Callable[[Optional[str]], bool]] = {
+SUPPORTED_PERIODICAL_MODES: dict[str, Callable[[Optional[str]], bool]] = {
     # Memory leak check is only needed for CUDA and ROCm jobs which utilize GPU memory
     "mem_leak_check": is_cuda_or_rocm_job,
     "rerun_disabled_tests": lambda job_name: True,
@@ -67,12 +69,18 @@ def parse_args() -> Any:
         "--test-matrix", type=str, required=True, help="the original test matrix"
     )
     parser.add_argument(
+        "--selected-test-configs",
+        type=str,
+        default="",
+        help="a comma-separated list of test configurations from the test matrix to keep",
+    )
+    parser.add_argument(
         "--workflow", type=str, help="the name of the current workflow, i.e. pull"
     )
     parser.add_argument(
         "--job-name",
         type=str,
-        help="the name of the current job, i.e. linux-focal-py3.8-gcc7 / build",
+        help="the name of the current job, i.e. linux-jammy-py3.8-gcc7 / build",
     )
     parser.add_argument("--pr-number", type=str, help="the pull request number")
     parser.add_argument("--tag", type=str, help="the associated tag if it exists")
@@ -95,8 +103,8 @@ def parse_args() -> Any:
     return parser.parse_args()
 
 
-@lru_cache(maxsize=None)
-def get_pr_info(pr_number: int) -> Dict[str, Any]:
+@cache
+def get_pr_info(pr_number: int) -> dict[str, Any]:
     """
     Dynamically get PR information
     """
@@ -109,7 +117,7 @@ def get_pr_info(pr_number: int) -> Dict[str, Any]:
         "Accept": "application/vnd.github.v3+json",
         "Authorization": f"token {github_token}",
     }
-    json_response: Dict[str, Any] = download_json(
+    json_response: dict[str, Any] = download_json(
         url=f"{pytorch_github_api}/issues/{pr_number}",
         headers=headers,
     )
@@ -121,7 +129,7 @@ def get_pr_info(pr_number: int) -> Dict[str, Any]:
     return json_response
 
 
-def get_labels(pr_number: int) -> Set[str]:
+def get_labels(pr_number: int) -> set[str]:
     """
     Dynamically get the latest list of labels from the pull request
     """
@@ -131,14 +139,14 @@ def get_labels(pr_number: int) -> Set[str]:
     }
 
 
-def filter_labels(labels: Set[str], label_regex: Any) -> Set[str]:
+def filter_labels(labels: set[str], label_regex: Any) -> set[str]:
     """
     Return the list of matching labels
     """
     return {l for l in labels if re.match(label_regex, l)}
 
 
-def filter(test_matrix: Dict[str, List[Any]], labels: Set[str]) -> Dict[str, List[Any]]:
+def filter(test_matrix: dict[str, list[Any]], labels: set[str]) -> dict[str, list[Any]]:
     """
     Select the list of test config to run from the test matrix. The logic works
     as follows:
@@ -150,7 +158,7 @@ def filter(test_matrix: Dict[str, List[Any]], labels: Set[str]) -> Dict[str, Lis
 
     If the PR has none of the test-config label, all tests are run as usual.
     """
-    filtered_test_matrix: Dict[str, List[Any]] = {"include": []}
+    filtered_test_matrix: dict[str, list[Any]] = {"include": []}
 
     for entry in test_matrix.get("include", []):
         config_name = entry.get("config", "")
@@ -177,13 +185,35 @@ def filter(test_matrix: Dict[str, List[Any]], labels: Set[str]) -> Dict[str, Lis
         return filtered_test_matrix
 
 
+def filter_selected_test_configs(
+    test_matrix: dict[str, list[Any]], selected_test_configs: set[str]
+) -> dict[str, list[Any]]:
+    """
+    Keep only the selected configs if the list if not empty. Otherwise, keep all test configs.
+    This filter is used when the workflow is dispatched manually.
+    """
+    if not selected_test_configs:
+        return test_matrix
+
+    filtered_test_matrix: dict[str, list[Any]] = {"include": []}
+    for entry in test_matrix.get("include", []):
+        config_name = entry.get("config", "")
+        if not config_name:
+            continue
+
+        if config_name in selected_test_configs:
+            filtered_test_matrix["include"].append(entry)
+
+    return filtered_test_matrix
+
+
 def set_periodic_modes(
-    test_matrix: Dict[str, List[Any]], job_name: Optional[str]
-) -> Dict[str, List[Any]]:
+    test_matrix: dict[str, list[Any]], job_name: Optional[str]
+) -> dict[str, list[Any]]:
     """
     Apply all periodic modes when running under a schedule
     """
-    scheduled_test_matrix: Dict[str, List[Any]] = {
+    scheduled_test_matrix: dict[str, list[Any]] = {
         "include": [],
     }
 
@@ -200,8 +230,8 @@ def set_periodic_modes(
 
 
 def mark_unstable_jobs(
-    workflow: str, job_name: str, test_matrix: Dict[str, List[Any]]
-) -> Dict[str, List[Any]]:
+    workflow: str, job_name: str, test_matrix: dict[str, list[Any]]
+) -> dict[str, list[Any]]:
     """
     Check the list of unstable jobs and mark them accordingly. Note that if a job
     is unstable, all its dependents will also be marked accordingly
@@ -216,8 +246,8 @@ def mark_unstable_jobs(
 
 
 def remove_disabled_jobs(
-    workflow: str, job_name: str, test_matrix: Dict[str, List[Any]]
-) -> Dict[str, List[Any]]:
+    workflow: str, job_name: str, test_matrix: dict[str, list[Any]]
+) -> dict[str, list[Any]]:
     """
     Check the list of disabled jobs, remove the current job and all its dependents
     if it exists in the list
@@ -232,15 +262,15 @@ def remove_disabled_jobs(
 
 
 def _filter_jobs(
-    test_matrix: Dict[str, List[Any]],
+    test_matrix: dict[str, list[Any]],
     issue_type: IssueType,
     target_cfg: Optional[str] = None,
-) -> Dict[str, List[Any]]:
+) -> dict[str, list[Any]]:
     """
     An utility function used to actually apply the job filter
     """
     # The result will be stored here
-    filtered_test_matrix: Dict[str, List[Any]] = {"include": []}
+    filtered_test_matrix: dict[str, list[Any]] = {"include": []}
 
     # This is an issue to disable a CI job
     if issue_type == IssueType.DISABLED:
@@ -273,10 +303,10 @@ def _filter_jobs(
 def process_jobs(
     workflow: str,
     job_name: str,
-    test_matrix: Dict[str, List[Any]],
+    test_matrix: dict[str, list[Any]],
     issue_type: IssueType,
     url: str,
-) -> Dict[str, List[Any]]:
+) -> dict[str, list[Any]]:
     """
     Both disabled and unstable jobs are in the following format:
 
@@ -303,7 +333,7 @@ def process_jobs(
         # The job name from github is in the PLATFORM / JOB (CONFIG) format, so breaking
         # it into its two components first
         current_platform, _ = (n.strip() for n in job_name.split(JOB_NAME_SEP, 1) if n)
-    except ValueError as error:
+    except ValueError:
         warnings.warn(f"Invalid job name {job_name}, returning")
         return test_matrix
 
@@ -412,7 +442,7 @@ def process_jobs(
     return test_matrix
 
 
-def download_json(url: str, headers: Dict[str, str], num_retries: int = 3) -> Any:
+def download_json(url: str, headers: dict[str, str], num_retries: int = 3) -> Any:
     for _ in range(num_retries):
         try:
             req = Request(url=url, headers=headers)
@@ -433,7 +463,7 @@ def set_output(name: str, val: Any) -> None:
         print(f"::set-output name={name}::{val}")
 
 
-def parse_reenabled_issues(s: Optional[str]) -> List[str]:
+def parse_reenabled_issues(s: Optional[str]) -> list[str]:
     # NB: When the PR body is empty, GitHub API returns a None value, which is
     # passed into this function
     if not s:
@@ -448,8 +478,8 @@ def parse_reenabled_issues(s: Optional[str]) -> List[str]:
     return issue_numbers
 
 
-def get_reenabled_issues(pr_body: str = "") -> List[str]:
-    default_branch = os.getenv("GIT_DEFAULT_BRANCH", "main")
+def get_reenabled_issues(pr_body: str = "") -> list[str]:
+    default_branch = f"origin/{os.environ.get('GIT_DEFAULT_BRANCH', 'main')}"
     try:
         commit_messages = subprocess.check_output(
             f"git cherry -v {default_branch}".split(" ")
@@ -460,12 +490,12 @@ def get_reenabled_issues(pr_body: str = "") -> List[str]:
     return parse_reenabled_issues(pr_body) + parse_reenabled_issues(commit_messages)
 
 
-def check_for_setting(labels: Set[str], body: str, setting: str) -> bool:
+def check_for_setting(labels: set[str], body: str, setting: str) -> bool:
     return setting in labels or f"[{setting}]" in body
 
 
 def perform_misc_tasks(
-    labels: Set[str], test_matrix: Dict[str, List[Any]], job_name: str, pr_body: str
+    labels: set[str], test_matrix: dict[str, list[Any]], job_name: str, pr_body: str
 ) -> None:
     """
     In addition to apply the filter logic, the script also does the following
@@ -477,9 +507,17 @@ def perform_misc_tasks(
         check_for_setting(labels, pr_body, "ci-verbose-test-logs"),
     )
     set_output(
+        "ci-test-showlocals", check_for_setting(labels, pr_body, "ci-test-showlocals")
+    )
+    set_output(
         "ci-no-test-timeout", check_for_setting(labels, pr_body, "ci-no-test-timeout")
     )
     set_output("ci-no-td", check_for_setting(labels, pr_body, "ci-no-td"))
+    # Only relevant for the one linux distributed cuda job, delete this when TD
+    # is rolled out completely
+    set_output(
+        "ci-td-distributed", check_for_setting(labels, pr_body, "ci-td-distributed")
+    )
 
     # Obviously, if the job name includes unstable, then this is an unstable job
     is_unstable = job_name and IssueType.UNSTABLE.value in job_name
@@ -525,7 +563,7 @@ def main() -> None:
 
     # If the tag matches, we can get the PR number from it, this is from ciflow
     # workflow dispatcher
-    tag_regex = re.compile(r"^ciflow/\w+/(?P<pr_number>\d+)$")
+    tag_regex = re.compile(r"^ciflow/[\w\-]+/(?P<pr_number>\d+)$")
 
     labels = set()
     if pr_number:
@@ -552,6 +590,16 @@ def main() -> None:
     else:
         # No PR number, no tag, we can just return the test matrix as it is
         filtered_test_matrix = test_matrix
+
+    if args.selected_test_configs:
+        selected_test_configs = {
+            v.strip().lower()
+            for v in args.selected_test_configs.split(",")
+            if v.strip()
+        }
+        filtered_test_matrix = filter_selected_test_configs(
+            filtered_test_matrix, selected_test_configs
+        )
 
     if args.event_name == "schedule" and args.schedule == "29 8 * * *":
         # we don't want to run the mem leak check or disabled tests on normal

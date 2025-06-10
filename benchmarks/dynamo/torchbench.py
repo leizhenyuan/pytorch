@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import functools
+
 import gc
 import importlib
 import logging
@@ -11,18 +11,41 @@ from collections import namedtuple
 from os.path import abspath, exists
 
 import torch
-import yaml
+
 
 try:
-    from .common import BenchmarkRunner, main
+    from .common import BenchmarkRunner, load_yaml_file, main
 except ImportError:
-    from common import BenchmarkRunner, main
+    from common import BenchmarkRunner, load_yaml_file, main
 
 from torch._dynamo.testing import collect_results, reduce_to_scalar_loss
 from torch._dynamo.utils import clone_inputs
 
+
 # We are primarily interested in tf32 datatype
 torch.backends.cuda.matmul.allow_tf32 = True
+
+# Enable FX graph caching
+if "TORCHINDUCTOR_FX_GRAPH_CACHE" not in os.environ:
+    torch._inductor.config.fx_graph_cache = True
+
+# Enable Autograd caching
+if "TORCHINDUCTOR_AUTOGRAD_CACHE" not in os.environ:
+    torch._functorch.config.enable_autograd_cache = True
+
+
+def _reassign_parameters(model):
+    # torch_geometric models register parameter as tensors due to
+    # https://github.com/pyg-team/pytorch_geometric/blob/master/torch_geometric/nn/dense/linear.py#L158-L168
+    # Since it is unusual thing to do, we just reassign them to parameters
+    def state_dict_hook(module, destination, prefix, local_metadata):
+        for name, param in module.named_parameters():
+            if isinstance(destination[name], torch.Tensor) and not isinstance(
+                destination[name], torch.nn.Parameter
+            ):
+                destination[name] = torch.nn.Parameter(destination[name])
+
+    model._register_state_dict_hook(state_dict_hook)
 
 
 def setup_torchbench_cwd():
@@ -37,6 +60,9 @@ def setup_torchbench_cwd():
         "../../torchbenchmark",
         "../../torchbench",
         "../../benchmark",
+        "../../../torchbenchmark",
+        "../../../torchbench",
+        "../../../benchmark",
     ):
         if exists(torchbench_dir):
             break
@@ -49,29 +75,29 @@ def setup_torchbench_cwd():
     return original_dir
 
 
-@functools.lru_cache(maxsize=1)
-def load_yaml_file():
-    filename = "torchbench.yaml"
-    filepath = os.path.join(os.path.dirname(__file__), filename)
+def process_hf_reformer_output(out):
+    assert isinstance(out, list)
+    # second output is unstable
+    return [elem for i, elem in enumerate(out) if i != 1]
 
-    with open(filepath) as f:
-        data = yaml.safe_load(f)
 
-    def flatten(lst):
-        for item in lst:
-            if isinstance(item, list):
-                yield from flatten(item)
-            else:
-                yield item
+def process_hf_whisper_output(out):
+    out_ret = []
+    for i, elem in enumerate(out):
+        if i == 0:
+            if elem is not None:
+                assert isinstance(elem, dict)
+                out_ret.append({k: v for k, v in elem.items() if k != "logits"})
+        elif i != 1:
+            out_ret.append(elem)
 
-    def maybe_list_to_set(obj):
-        if isinstance(obj, dict):
-            return {k: maybe_list_to_set(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return set(flatten(obj))
-        return obj
+    return out_ret
 
-    return maybe_list_to_set(data)
+
+process_train_model_output = {
+    "hf_Reformer": process_hf_reformer_output,
+    "hf_Whisper": process_hf_whisper_output,
+}
 
 
 class TorchBenchmarkRunner(BenchmarkRunner):
@@ -82,7 +108,7 @@ class TorchBenchmarkRunner(BenchmarkRunner):
 
     @property
     def _config(self):
-        return load_yaml_file()
+        return load_yaml_file("torchbench.yaml")
 
     @property
     def _skip(self):
@@ -95,6 +121,10 @@ class TorchBenchmarkRunner(BenchmarkRunner):
     @property
     def _tolerance(self):
         return self._config["tolerance"]
+
+    @property
+    def _require_larger_multiplier_for_smaller_tensor(self):
+        return self._config["require_larger_multiplier_for_smaller_tensor"]
 
     @property
     def _accuracy(self):
@@ -113,8 +143,16 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         return self._skip["device"]["cuda"]
 
     @property
-    def skip_models_for_freezing(self):
-        return self._skip["freezing"]
+    def skip_models_for_freezing_cuda(self):
+        return self._skip["freezing"]["cuda"]
+
+    @property
+    def disable_cudagraph_models(self):
+        return self._config["disable_cudagraph"]
+
+    @property
+    def skip_models_for_freezing_cpu(self):
+        return self._skip["freezing"]["cpu"]
 
     @property
     def slow_models(self):
@@ -127,6 +165,10 @@ class TorchBenchmarkRunner(BenchmarkRunner):
     @property
     def non_deterministic_models(self):
         return self._config["non_deterministic"]
+
+    @property
+    def get_output_amp_train_process_func(self):
+        return process_train_model_output
 
     @property
     def skip_not_suitable_for_training_models(self):
@@ -164,6 +206,31 @@ class TorchBenchmarkRunner(BenchmarkRunner):
     def skip_models_due_to_control_flow(self):
         return self._skip["control_flow"]
 
+    @property
+    def skip_models_due_to_export_not_supported(self):
+        return self._skip["export_not_supported"]
+
+    @property
+    def guard_on_nn_module_models(self):
+        return {
+            "vision_maskrcnn",
+        }
+
+    @property
+    def inline_inbuilt_nn_modules_models(self):
+        return {
+            "basic_gnn_edgecnn",
+            "drq",
+            "hf_Reformer",
+            "DALLE2_pytorch",
+            "hf_BigBird",
+            "detectron2_maskrcnn_r_50_fpn",
+            "detectron2_maskrcnn_r_101_fpn",
+            "vision_maskrcnn",
+            "doctr_reco_predictor",
+            "hf_T5_generate",
+        }
+
     def load_model(
         self,
         device,
@@ -178,7 +245,6 @@ class TorchBenchmarkRunner(BenchmarkRunner):
             )
         is_training = self.args.training
         use_eval_mode = self.args.use_eval_mode
-        dynamic_shapes = self.args.dynamic_shapes
         candidates = [
             f"torchbenchmark.models.{model_name}",
             f"torchbenchmark.canary_models.{model_name}",
@@ -250,6 +316,7 @@ class TorchBenchmarkRunner(BenchmarkRunner):
                 extra_args=extra_args,
                 model_kwargs=model_kwargs,
             )
+            use_eval_mode = True
         elif is_training:
             benchmark = benchmark_cls(
                 test="train",
@@ -265,6 +332,14 @@ class TorchBenchmarkRunner(BenchmarkRunner):
                 extra_args=extra_args,
             )
         model, example_inputs = benchmark.get_module()
+        if model_name in [
+            "basic_gnn_edgecnn",
+            "basic_gnn_gcn",
+            "basic_gnn_sage",
+            "basic_gnn_gin",
+        ]:
+            _reassign_parameters(model)
+
         # Models that must be in train mode while training
         if is_training and (
             not use_eval_mode or model_name in self._config["only_training"]
@@ -324,8 +399,8 @@ class TorchBenchmarkRunner(BenchmarkRunner):
 
             model_name = os.path.basename(model_path)
             if (
-                not re.search("|".join(args.filter), model_name, re.I)
-                or re.search("|".join(args.exclude), model_name, re.I)
+                not re.search("|".join(args.filter), model_name, re.IGNORECASE)
+                or re.search("|".join(args.exclude), model_name, re.IGNORECASE)
                 or model_name in args.exclude_exact
                 or model_name in self.skip_models
             ):
@@ -339,20 +414,32 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         else:
             return torch.no_grad()
 
+    def use_larger_multiplier_for_smaller_tensor(self, name):
+        return name in self._require_larger_multiplier_for_smaller_tensor
+
     def get_tolerance_and_cosine_flag(self, is_training, current_device, name):
         tolerance = 1e-4
         cosine = self.args.cosine
         # Increase the tolerance for torch allclose
         if self.args.float16 or self.args.amp:
+            if self.args.freezing and (freezing := self._tolerance["freezing"]):
+                higher_fp16 = freezing.get("higher_fp16", None)
+                even_higher = freezing.get("even_higher", None)
+                if higher_fp16 and name in higher_fp16:
+                    return 1e-2, cosine
+                elif even_higher and name in even_higher:
+                    return 8 * 1e-2, cosine
             if name in self._tolerance["higher_fp16"]:
                 return 1e-2, cosine
+            elif name in self._tolerance["even_higher"]:
+                return 8 * 1e-2, cosine
             return 1e-3, cosine
 
         if self.args.bfloat16:
             if name in self._tolerance["higher_bf16"]:
                 return 1e-2, cosine
 
-        if is_training and current_device == "cuda":
+        if is_training and (current_device == "cuda" or current_device == "xpu"):
             tolerance = 1e-3
             if name in self._tolerance["cosine"]:
                 cosine = True
@@ -367,18 +454,24 @@ class TorchBenchmarkRunner(BenchmarkRunner):
 
     def forward_pass(self, mod, inputs, collect_outputs=True):
         with self.autocast(**self.autocast_arg):
-            return mod(*inputs)
+            if isinstance(inputs, dict):
+                return mod(**inputs)
+            else:
+                return mod(*inputs)
 
     def forward_and_backward_pass(self, mod, inputs, collect_outputs=True):
         cloned_inputs = clone_inputs(inputs)
         self.optimizer_zero_grad(mod)
         with self.autocast(**self.autocast_arg):
-            pred = mod(*cloned_inputs)
+            if isinstance(cloned_inputs, dict):
+                pred = mod(**cloned_inputs)
+            else:
+                pred = mod(*cloned_inputs)
             loss = self.compute_loss(pred)
         self.grad_scaler.scale(loss).backward()
         self.optimizer_step()
         if collect_outputs:
-            return collect_results(mod, pred, loss, cloned_inputs)
+            return collect_results(mod, None, loss, cloned_inputs)
         return None
 
 

@@ -6,7 +6,7 @@ import math
 import types
 import unittest
 import warnings
-from typing import Any, Dict, Set
+from typing import Any
 
 import torch
 import torch._dynamo.config as config
@@ -15,13 +15,20 @@ import torch._functorch.deprecated as deprecated_func
 from torch._dynamo.trace_rules import (
     LEGACY_MOD_INLINELIST,
     load_object,
+    lookup_inner,
     manual_torch_name_rule_map,
     MOD_INLINELIST,
     torch_c_binding_in_graph_functions,
     torch_non_c_binding_in_graph_functions,
 )
 from torch._dynamo.utils import hashable, is_safe_constant, istype
-from torch._dynamo.variables import TorchInGraphFunctionVariable, UserFunctionVariable
+from torch._dynamo.variables import (
+    SkipFunctionVariable,
+    TorchInGraphFunctionVariable,
+    UserFunctionVariable,
+)
+from torch.testing._internal.common_utils import skipIfWindows
+
 
 try:
     from .utils import create_dummy_module_and_function
@@ -33,6 +40,13 @@ ignored_c_binding_in_graph_function_names = {
     # Ignored because they have manual rules defined at `trace_rules.manual_torch_name_rule_map`.
     "torch._nested_tensor_from_mask",
     "torch._nested_from_padded",
+    "torch.sparse_compressed_tensor",
+    "torch.sparse_bsc_tensor",
+    "torch.sparse_bsr_tensor",
+    "torch.sparse_coo_tensor",
+    "torch.sparse_csc_tensor",
+    "torch.sparse_csr_tensor",
+    "torch.cuda._get_device_properties",
     # Ignored and go through rules defined at `trace_rules.check`.
     "torch._functionalize_are_all_mutations_under_no_grad_or_inference_mode",
     "torch._cslt_sparse_mm_search",
@@ -62,7 +76,13 @@ ignored_c_binding_in_graph_function_names = {
     "torch._test_parallel_materialize",
     "torch._C._storage_address",
     "torch._C._pickle_save",
-    "torch.cuda._get_device_properties",
+    "torch._validate_sparse_compressed_tensor_args",
+    "torch._validate_sparse_csr_tensor_args",
+    "torch._validate_sparse_bsr_tensor_args",
+    "torch._validate_sparse_csc_tensor_args",
+    "torch._validate_sparse_coo_tensor_args",
+    "torch._validate_sparse_bsc_tensor_args",
+    "torch._validate_compressed_sparse_indices",
 }
 if torch._C._llvm_enabled():
     ignored_c_binding_in_graph_function_names |= {
@@ -88,10 +108,10 @@ class AllowedObjects:
     from the heuristic defined in `gen_allowed_objs_and_ids`.
     """
 
-    object_ids: Dict[int, str]
-    c_binding_in_graph_functions: Set[Any]
-    non_c_binding_in_graph_functions: Set[Any]
-    name_rule_map: Dict[str, Any]
+    object_ids: dict[int, str]
+    c_binding_in_graph_functions: set[Any]
+    non_c_binding_in_graph_functions: set[Any]
+    name_rule_map: dict[str, Any]
 
 
 def gen_allowed_objs_and_ids(record=False, c_binding_only=True) -> AllowedObjects:
@@ -100,10 +120,10 @@ def gen_allowed_objs_and_ids(record=False, c_binding_only=True) -> AllowedObject
     """
 
     warnings.filterwarnings("ignore", category=UserWarning, module="torch.distributed")
-    torch_object_ids = dict()
+    torch_object_ids = {}
     c_binding_in_graph_functions = set()
     non_c_binding_in_graph_functions = set()
-    torch_name_rule_map = dict()
+    torch_name_rule_map = {}
 
     # In some platforms, these functions were loaded as classes instead of functions.
     # To mitigate these weired cases, we need this special check.
@@ -214,9 +234,8 @@ def gen_allowed_objs_and_ids(record=False, c_binding_only=True) -> AllowedObject
             "torch.serialization",
             "torch.storage",
             "torch.utils",
+            "torch.distributed.",
         ]
-        if config.trace_distributed:
-            disallowed_modules.append("torch.distributed.")
 
         allowed_modules_dot = tuple([x + "." for x in allowed_modules])
         module = inspect.getmodule(obj)
@@ -309,10 +328,16 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
     # or loaded in case there is typo in the strings.
     def test_skipfiles_inlinelist(self):
         for m in LEGACY_MOD_INLINELIST.union(MOD_INLINELIST):
-            self.assertTrue(
-                isinstance(importlib.import_module(m), types.ModuleType),
-                f"{m} from trace_rules.MOD_INLINELIST/LEGACY_MOD_INLINELIST is not a python module, please check and correct it.",
-            )
+            try:
+                mod = importlib.import_module(m)
+            except ImportError:
+                continue
+            else:
+                self.assertTrue(
+                    isinstance(mod, types.ModuleType),
+                    f"{m} from trace_rules.MOD_INLINELIST/LEGACY_MOD_INLINELIST "
+                    "is not a python module, please check and correct it.",
+                )
 
     @unittest.skip(
         "This test keeps getting broken and our disable infra is not handling well. see #120627"
@@ -418,6 +443,75 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
             ref = fn(x)
             res = opt_fn(x)
             self.assertEqual(ref, res)
+
+    def test_no_special_handlers_for_torch_non_c_bindings(self):
+        handlers = TorchInGraphFunctionVariable._get_handlers()
+        # These handlers are manually audited to be safe
+        safe_handlers = (
+            "handle_tracing_state_functions",  # No global state (constant)
+            "handle_radians",  # No global state (constant)
+            "handle_is_tensor",  # No global state
+            "handle_torch_compile",  # No global state, constant
+            "handle_ntuple",  # No global state
+            "handle_is_grad_enabled",  # Safely implemented
+            "handle_use_deterministic_algorithms",  # Guarded variable
+            "handle_are_deterministic_algorithms_enabled",  # Guarded constant
+            "handle_device_interface_stream",  # No global state
+            "handle_cudnn_is_acceptable",  # No global state
+            "handle_assert",  # No global state (constant)
+            "handle_nested_tensor",  # No global state
+        )
+        for fn in handlers:
+            if isinstance(fn, staticmethod) or inspect.ismethod(fn):
+                fn_name = f"{fn.__module__}#{fn.__name__}"
+            else:
+                fn_name = f"{fn.__module__}.{fn.__name__}"
+            if handlers[fn].__name__ in safe_handlers:
+                continue
+            self.assertFalse(
+                fn_name in torch_non_c_binding_in_graph_functions,
+                (
+                    f"torch function {fn_name} has a special handler {handlers[fn].__name__}.\n"
+                    "We expected all functions in `torch_non_c_binding_in_graph_functions` to be safe to cache.\n"
+                    "Functions with special handlers may not be safe to cache, since they can close over global state.\n"
+                    "If your handler/function is safe to cache, please add it to the list of safe handlers above.\n"
+                    "Otherwise, add it to `manual_torch_name_rule_map` instead."
+                ),
+            )
+
+    def test_almost_impossible_missing_name(self):
+        class weird:  # noqa: UP004
+            def __getattribute__(self, name):
+                if name == "__name__":
+                    raise AttributeError("test")
+
+        w = weird()
+        o = set()
+        with self.assertRaises(AttributeError):
+            w.__name__
+        self.assertEqual(lookup_inner(w, name=None, reasons=o), SkipFunctionVariable)
+
+
+class TestModuleSurviveSkipFiles(torch._dynamo.test_case.TestCase):
+    @unittest.skipIf(
+        not torch.distributed.is_available(),
+        "need to import MLP module from distributed",
+    )
+    @skipIfWindows(
+        msg="AssertionError: False is not true : MLP did not survive skip files"
+    )
+    def test_module_survive_skip_files(self):
+        from torch.testing._internal.common_fsdp import MLP
+
+        model = MLP(3)
+        inp = torch.randn((2, 3))
+        frame_count_before = torch._dynamo.convert_frame.FRAME_COUNTER
+        model.compile(backend="eager")
+        model(inp)
+        frame_count_after = torch._dynamo.convert_frame.FRAME_COUNTER
+        self.assertTrue(
+            frame_count_after > frame_count_before, "MLP did not survive skip files"
+        )
 
 
 if __name__ == "__main__":

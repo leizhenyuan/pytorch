@@ -212,12 +212,14 @@ headers = {"Authorization": f"token {token}"}
 
 def run_query(query):
     request = requests.post(
-        "https://api.github.com/graphql", json={"query": query}, headers=headers
+        "https://api.github.com/graphql",  # @lint-ignore
+        json={"query": query},
+        headers=headers,
     )
     if request.status_code == 200:
         return request.json()
     else:
-        raise Exception(
+        raise Exception(  # noqa: TRY002
             f"Query failed to run by returning code of {request.status_code}. {request.json()}"
         )
 
@@ -252,7 +254,7 @@ def github_data(pr_number):
         }
       }
     }
-    """
+    """  # noqa: UP031
         % pr_number
     )
     query = run_query(query)
@@ -262,7 +264,7 @@ def github_data(pr_number):
         if len(_ERRORS) < _MAX_ERROR_LEN:
             return [], "None", ()
         else:
-            raise Exception(
+            raise Exception(  # noqa: TRY002
                 f"Got {_MAX_ERROR_LEN} errors: {_ERRORS}, please check if"
                 " there is something wrong"
             )
@@ -287,7 +289,7 @@ def get_features(commit_hash):
     pr_number = parse_pr_number(body, commit_hash, title)
     labels = []
     author = ""
-    accepters = tuple()
+    accepters = ()
     if pr_number is not None:
         labels, author, accepters = github_data(pr_number)
     result = Features(title, body, pr_number, files_changed, labels, author, accepters)
@@ -321,7 +323,7 @@ class _CommitDataCache:
         return self.data[commit]
 
     def read_from_disk(self):
-        with open(self.path, "r") as f:
+        with open(self.path) as f:
             data = json.load(f)
             data = {commit: dict_to_features(dct) for commit, dct in data.items()}
         return data
